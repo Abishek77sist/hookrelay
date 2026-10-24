@@ -1,0 +1,84 @@
+# One command starts everything:  docker compose up --build
+#
+# The values like ${POSTGRES_DB:-hookrelay} mean:
+# "use the POSTGRES_DB variable from .env if it exists, otherwise use 'hookrelay'".
+# So the project works even if you never create a .env file.
+
+x-app-env: &app-env
+  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-only-insecure-key-change-me}
+  DJANGO_DEBUG: ${DJANGO_DEBUG:-True}
+  POSTGRES_DB: ${POSTGRES_DB:-hookrelay}
+  POSTGRES_USER: ${POSTGRES_USER:-hookrelay}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hookrelay}
+  POSTGRES_HOST: postgres      # the service name below acts as the hostname
+  POSTGRES_PORT: "5432"
+  REDIS_URL: redis://redis:6379/0
+  # SSRF protection toggle. True = allow localhost/private IPs (needed for the demo).
+  HOOKRELAY_ALLOW_PRIVATE_URLS: ${HOOKRELAY_ALLOW_PRIVATE_URLS:-True}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hookrelay}
+      POSTGRES_USER: ${POSTGRES_USER:-hookrelay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hookrelay}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hookrelay}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # The API server. It also creates + applies migrations on start.
+  web:
+    build: .
+    command: >
+      sh -c "python manage.py makemigrations accounts endpoints events deliveries --noinput &&
+             python manage.py migrate --noinput &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --reload"
+    environment: *app-env
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Celery worker: runs the delivery tasks (phase 3)
+  worker:
+    build: .
+    command: celery -A config worker --loglevel=info
+    environment: *app-env
+    volumes:
+      - .:/app
+    depends_on:
+      - web
+      - postgres
+      - redis
+
+  # Celery beat: runs scheduled jobs, e.g. picking up due retries (phase 3)
+  beat:
+    build: .
+    command: celery -A config beat --loglevel=info
+    environment: *app-env
+    volumes:
+      - .:/app
+    depends_on:
+      - web
+      - redis
+
+volumes:
+  postgres_data:
